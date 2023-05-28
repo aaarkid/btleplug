@@ -23,6 +23,7 @@
 
 pub(crate) mod bdaddr;
 pub mod bleuuid;
+pub mod util;
 
 use crate::Result;
 use async_trait::async_trait;

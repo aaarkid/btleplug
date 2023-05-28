@@ -21,7 +21,7 @@ use crate::{
         AddressType, BDAddr, CentralEvent, Characteristic, Peripheral as ApiPeripheral,
         PeripheralProperties, Service, ValueNotification, WriteType,
     },
-    common::{adapter_manager::AdapterManager, util::notifications_stream_from_broadcast_receiver},
+    common::{adapter_manager::AdapterManager},
     Error, Result,
 };
 use async_trait::async_trait;
@@ -33,18 +33,24 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
 use serde_cr as serde;
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     convert::TryInto,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
     sync::atomic::{AtomicBool, Ordering},
     sync::{Arc, RwLock},
+
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use std::sync::Weak;
 use windows::Devices::Bluetooth::{Advertisement::*, BluetoothAddressType};
+
+use std::task::{Context, Poll};
+use futures::StreamExt;
+
+use tokio_stream::wrappers::BroadcastStream;
 
 #[cfg_attr(
     feature = "serde",
@@ -509,7 +515,43 @@ impl ApiPeripheral for Peripheral {
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let receiver = self.shared.notifications_channel.subscribe();
-        Ok(notifications_stream_from_broadcast_receiver(receiver))
+        let stream = Box::pin(NotificationStreamWrapper::new(receiver));
+        Ok(stream)
+    }
+}
+
+struct NotificationStreamWrapper {
+    inner: BroadcastStream<ValueNotification>,
+    buffer: VecDeque<ValueNotification>,
+}
+
+impl NotificationStreamWrapper {
+    fn new(inner: broadcast::Receiver<ValueNotification>) -> Self {
+        Self {
+            inner: BroadcastStream::new(inner),
+            buffer: VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for NotificationStreamWrapper {
+    type Item = ValueNotification;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        println!("Notification polled: {:?}", std::time::SystemTime::now());
+        if let Some(notification) = self.buffer.pop_front() {
+            return Poll::Ready(Some(notification));
+        }
+
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(notification))) => {
+                self.buffer.push_back(notification);
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(_))) => Poll::Ready(None), // end the stream on error
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

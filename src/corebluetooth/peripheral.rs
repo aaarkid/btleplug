@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_cr as serde;
 use std::sync::Weak;
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, VecDeque},
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
     sync::{Arc, Mutex},
@@ -38,6 +38,11 @@ use std::{
 use tokio::sync::broadcast;
 use tokio::task;
 use uuid::Uuid;
+
+use std::task::{Context, Poll};
+use futures::StreamExt;
+
+use tokio_stream::wrappers::BroadcastStream;
 
 #[cfg_attr(
     feature = "serde",
@@ -372,7 +377,42 @@ impl api::Peripheral for Peripheral {
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let receiver = self.shared.notifications_channel.subscribe();
-        Ok(notifications_stream_from_broadcast_receiver(receiver))
+        let stream = Box::pin(NotificationStreamWrapper::new(receiver));
+        Ok(stream)
+    }
+}
+
+struct NotificationStreamWrapper {
+    inner: BroadcastStream<ValueNotification>,
+    buffer: VecDeque<ValueNotification>,
+}
+
+impl NotificationStreamWrapper {
+    fn new(inner: broadcast::Receiver<ValueNotification>) -> Self {
+        Self {
+            inner: BroadcastStream::new(inner),
+            buffer: VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for NotificationStreamWrapper {
+    type Item = ValueNotification;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(notification) = self.buffer.pop_front() {
+            return Poll::Ready(Some(notification));
+        }
+
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(notification))) => {
+                self.buffer.push_back(notification);
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(_))) => Poll::Ready(None), // end the stream on error
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

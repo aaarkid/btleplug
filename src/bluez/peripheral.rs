@@ -9,10 +9,12 @@ use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
 use serde_cr as serde;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt::{self, Display, Formatter};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use tokio::sync::broadcast::BroadcastStream;
 use uuid::Uuid;
 
 use crate::api::{
@@ -197,7 +199,8 @@ impl api::Peripheral for Peripheral {
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
         let device_id = self.device.clone();
-        let events = self.session.device_event_stream(&device_id).await?;
+        let raw_events = self.session.device_event_stream(&device_id).await?;
+        let events = EventStreamWrapper::new(raw_events);
         let services = self.services.clone();
         Ok(Box::pin(events.filter_map(move |event| {
             ready(value_notification(event, &device_id, services.clone()))
@@ -220,6 +223,40 @@ fn value_notification(
             Some(ValueNotification { uuid, value })
         }
         _ => None,
+    }
+}
+
+struct NotificationStreamWrapper {
+    inner: BroadcastStream<ValueNotification>,
+    buffer: VecDeque<ValueNotification>,
+}
+
+impl NotificationStreamWrapper {
+    fn new(inner: broadcast::Receiver<ValueNotification>) -> Self {
+        Self {
+            inner: BroadcastStream::new(inner),
+            buffer: VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for NotificationStreamWrapper {
+    type Item = ValueNotification;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(notification) = self.buffer.pop_front() {
+            return Poll::Ready(Some(notification));
+        }
+
+        match self.inner.poll_next_unpin(cx) {
+            Poll::Ready(Some(Ok(notification))) => {
+                self.buffer.push_back(notification);
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(_))) => Poll::Ready(None), // end the stream on error
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 

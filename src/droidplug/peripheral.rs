@@ -19,12 +19,15 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "serde")]
 use serde_cr as serde;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, VecDeque},
     convert::TryFrom,
     fmt::{self, Debug, Display, Formatter},
     pin::Pin,
     sync::{Arc, Mutex},
 };
+
+use std::task::{Context, Poll};
+use futures::StreamExt;
 
 use super::jni::{
     global_jvm,
@@ -274,21 +277,49 @@ impl api::Peripheral for Peripheral {
     }
 
     async fn notifications(&self) -> Result<Pin<Box<dyn Stream<Item = ValueNotification> + Send>>> {
-        use futures::stream::StreamExt;
         let stream = self.with_obj(|_env, obj| JSendStream::try_from(obj.get_notifications()?))?;
-        let stream = stream
-            .map(|item| match item {
-                Ok(item) => {
-                    let env = global_jvm().get_env()?;
-                    let item = item.as_obj();
-                    let characteristic = JBluetoothGattCharacteristic::from_env(&env, item)?;
-                    let uuid = characteristic.get_uuid()?;
-                    let value = characteristic.get_value()?;
-                    Ok(ValueNotification { uuid, value })
-                }
-                Err(err) => Err(err),
-            })
-            .filter_map(|item| async { item.ok() });
-        Ok(Box::pin(stream))
+        let stream = Box::pin(NotificationStreamWrapper::new(stream));
+        Ok(stream)
+    }
+}
+
+struct NotificationStreamWrapper {
+    inner: Pin<Box<dyn Stream<Item = Result<JObject, Error>> + Send>>,
+    buffer: VecDeque<ValueNotification>,
+}
+
+impl NotificationStreamWrapper {
+    fn new(inner: Pin<Box<dyn Stream<Item = Result<JObject, Error>> + Send>>) -> Self {
+        Self {
+            inner,
+            buffer: VecDeque::new(),
+        }
+    }
+}
+
+impl Stream for NotificationStreamWrapper {
+    type Item = ValueNotification;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(notification) = self.buffer.pop_front() {
+            return Poll::Ready(Some(notification));
+        }
+
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                let env = global_jvm().get_env().expect("Failed to get JVM environment");
+                let item = item.as_obj();
+                let characteristic = JBluetoothGattCharacteristic::from_env(&env, item).expect("Failed to get characteristic");
+                let uuid = characteristic.get_uuid().expect("Failed to get UUID");
+                let value = characteristic.get_value().expect("Failed to get value");
+                let notification = ValueNotification { uuid, value };
+
+                self.buffer.push_back(notification);
+                Poll::Pending
+            }
+            Poll::Ready(Some(Err(_))) => Poll::Ready(None), // end the stream on error
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
